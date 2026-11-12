@@ -1,0 +1,106 @@
+name: Windows.Applications.OfficeMacros.MaldocTrace
+author: debugactiveprocess
+description: |
+  Triage Office documents on the endpoint with
+  [MaldocTrace](https://github.com/debugactiveprocess/MaldocTrace), a
+  static analyzer and safe VBA emulator for malicious Office documents.
+
+  For every document matching `TargetGlob`, MaldocTrace extracts the VBA
+  project (Word, Excel, OOXML and encrypted Office files), emulates the
+  macros against a simulated Windows environment and reports the
+  deobfuscated command lines, dropped files and indicators of compromise.
+  Nothing in the document is executed and the emulator makes no network
+  connections.
+
+  By default only documents that contain macros are reported. Set
+  `ShowAllDocuments` to also list documents without macros, and
+  `UploadSuspicious` to collect the documents whose macros launch
+  commands or drop files.
+
+  #maldoc #triage #vba #office
+
+reference:
+  - https://github.com/debugactiveprocess/MaldocTrace
+
+tools:
+  - name: MaldocTrace
+    url: https://github.com/debugactiveprocess/MaldocTrace/releases/download/v0.3.0/maldocTrace_0.3.0_windows_amd64.zip
+    expected_hash: f540722f087f7c7ba8e813a4e31991082f31cf7abcf414bcf14a8be9fd9c515d
+    version: 0.3.0
+
+required_permissions:
+  - EXECVE
+  - FILESYSTEM_WRITE
+
+precondition: SELECT OS FROM info() WHERE OS = 'windows'
+
+parameters:
+  - name: TargetGlob
+    description: Documents to analyze.
+    default: 'C:\Users\**\*.{doc,dot,docm,docx,dotm,xls,xlt,xlm,xlsm,xlsb,xlsx,xltm,ppt,pptm,pptx,potm,rtf}'
+  - name: MaxSize
+    description: Skip files larger than this many bytes.
+    type: int
+    default: 52428800
+  - name: Timeout
+    description: Per-document analysis timeout (Go duration).
+    default: 60s
+  - name: ShowAllDocuments
+    description: Also report documents without macros.
+    type: bool
+  - name: UploadSuspicious
+    description: Upload documents whose macros launch commands or drop files.
+    type: bool
+  - name: IncludeFullReport
+    description: Add the complete MaldocTrace JSON report to each row.
+    type: bool
+
+sources:
+  - query: |
+      LET bin <= SELECT OSPath
+        FROM Artifact.Generic.Utils.FetchBinary(ToolName="MaldocTrace",
+                                                 IsExecutable=FALSE)
+
+      LET tmp <= tempdir()
+
+      LET extracted <= SELECT *
+        FROM unzip(filename=bin[0].OSPath, output_directory=tmp)
+
+      LET exe <= SELECT OSPath
+        FROM glob(globs="**/maldocTrace.exe", root=tmp)
+        LIMIT 1
+
+      LET docs = SELECT OSPath, Size, Mtime, Btime
+        FROM glob(globs=TargetGlob)
+        WHERE NOT IsDir AND Size > 0 AND Size < MaxSize
+
+      LET analyzed = SELECT * FROM foreach(
+          row=docs,
+          query={
+            SELECT OSPath, Size, Mtime, Btime,
+                   parse_json(data=Stdout) AS Report
+            FROM execve(argv=[exe[0].OSPath, "analyze", OSPath,
+                              "--format", "json", "--timeout", Timeout],
+                        length=100000000)
+            WHERE Stdout
+          })
+
+      LET rows = SELECT OSPath, Size, Mtime, Btime,
+             Report.file.sha256 AS SHA256,
+             Report.format AS Format,
+             Report.macros AS Macros,
+             Report.encrypted AS Encrypted,
+             Report.status AS Status,
+             Report.commands.command_line AS Commands,
+             Report.artifacts.path AS DroppedFiles,
+             Report.indicators.value AS Indicators,
+             len(list=Report.commands) > 0 OR
+               len(list=Report.artifacts) > 0 AS Suspicious,
+             if(condition=IncludeFullReport, then=Report) AS FullReport
+        FROM analyzed
+        WHERE ShowAllDocuments OR Macros = "present"
+
+      SELECT *,
+             if(condition=UploadSuspicious AND Suspicious,
+                then=upload(file=OSPath)) AS Upload
+      FROM rows
